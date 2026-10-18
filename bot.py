@@ -2,6 +2,7 @@ import os
 import time
 import sqlite3
 import requests
+
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
@@ -31,9 +32,15 @@ Never copy existing books. Never promise sales.
 Review your writing for emotional depth, logic and continuity before answering."""
 
 def ai(prompt, tokens=3000):
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is missing")
+
     r = requests.post(
         GROQ_URL,
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        },
         json={
             "model": MODEL,
             "messages": [
@@ -41,12 +48,32 @@ def ai(prompt, tokens=3000):
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.85,
-            "max_tokens": tokens
+            "max_completion_tokens": tokens,
+            "reasoning_effort": "low",
+            "include_reasoning": False
         },
         timeout=180
     )
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+
+    if not r.ok:
+        raise RuntimeError(
+            f"Groq HTTP {r.status_code}: {r.text[:1500]}"
+        )
+
+    data = r.json()
+    choices = data.get("choices", [])
+    if not choices:
+        raise RuntimeError(
+            f"Groq returned no choices: {str(data)[:1000]}"
+        )
+
+    content = choices[0].get("message", {}).get("content")
+    if not content or not content.strip():
+        raise RuntimeError(
+            f"Groq returned empty content: {str(data)[:1000]}"
+        )
+
+    return content
 
 def send(chat, text):
     for i in range(0, len(text), 3500):
@@ -65,6 +92,7 @@ def project(chat):
 
 def new_story(chat):
     send(chat, "Inventing an original novel and building its story bible...")
+
     result = ai("""Invent three original novel concepts, compare them, and
 choose the strongest. Build a complete story bible and four-part plot outline.
 Include title, genre, premise, characters, motives, fears, secrets,
@@ -95,6 +123,7 @@ OUTLINE:
 
     if collected["BIBLE"]:
         bible = "\n".join(collected["BIBLE"]).strip()
+
     if collected["OUTLINE"]:
         outline = "\n".join(collected["OUTLINE"]).strip()
 
@@ -104,7 +133,11 @@ OUTLINE:
     )
     DB.execute("DELETE FROM chapters WHERE chat=?", (chat,))
     DB.commit()
-    send(chat, f"YOUR NEW NOVEL\n\n{title}\n\n{bible}\n\nMASTER OUTLINE:\n{outline}")
+
+    send(
+        chat,
+        f"YOUR NEW NOVEL\n\n{title}\n\n{bible}\n\nMASTER OUTLINE:\n{outline}"
+    )
 
 def write_chapter(chat):
     p = project(chat)
@@ -113,43 +146,62 @@ def write_chapter(chat):
         return
 
     title, bible, outline, number = p
+
     recent = DB.execute(
         "SELECT number,text,memory FROM chapters WHERE chat=? "
-        "ORDER BY number DESC LIMIT 3", (chat,)
+        "ORDER BY number DESC LIMIT 3",
+        (chat,)
     ).fetchall()
 
+    # Use compact continuity notes instead of full previous chapters.
     history = "\n\n".join(
-        f"CHAPTER {n}:\n{t}\nCONTINUITY MEMORY: {m}"
+        f"CHAPTER {n} CONTINUITY NOTES:\n{(m or '')[:1200]}"
         for n, t, m in reversed(recent)
     )
 
+    latest_excerpt = ""
+    if recent:
+        latest_text = recent[0][1] or ""
+        latest_excerpt = latest_text[-1800:]
+
+    # Bound the prompt to reduce oversized Groq requests.
+    bible = (bible or "")[:5000]
+    outline = (outline or "")[:4000]
+
     send(chat, f"Writing Chapter {number} of {title}...")
+
     prompt = f"""NOVEL: {title}
+
 STORY BIBLE:
 {bible}
+
 MASTER OUTLINE:
 {outline}
-PREVIOUS CHAPTERS AND CONTINUITY:
+
+PREVIOUS CHAPTER CONTINUITY NOTES:
 {history or "Chapter 1: establish character, setting and conflict."}
+
+LATEST CHAPTER EXCERPT (for immediate continuity):
+{latest_excerpt}
 
 EMOTIONAL INTELLIGENCE:
 Track each important character's visible emotion, hidden emotion,
 desire, fear, internal contradiction and relationship changes.
 Use subtext and distinct voices. Let feelings influence decisions.
 Build tension through uncertainty, silence, consequences and pacing.
-Avoid explaining every emotion. Do not make characters act against
-established knowledge or motives without a believable reason.
+Avoid explaining every emotion. Keep character actions consistent.
 
 Write polished, immersive Chapter {number}, approximately 900-1200 words.
 Continue naturally, advance the plot, and do not resolve the entire novel.
-Before responding, silently review emotional realism, continuity, pacing,
-dialogue and repetitive wording; revise weak passages.
+Review emotional realism, continuity, pacing, dialogue and repetition.
 
 End with this exact separator:
 [CONTINUITY MEMORY]
 Then record concise factual notes: events, character changes, new facts,
 unresolved threads and what should happen next. The notes aren't fiction."""
+
     result = ai(prompt, 4000)
+
     parts = result.split("[CONTINUITY MEMORY]", 1)
     chapter = parts[0].strip()
     memory = parts[1].strip() if len(parts) > 1 else (
@@ -165,32 +217,144 @@ unresolved threads and what should happen next. The notes aren't fiction."""
         (number + 1, chat)
     )
     DB.commit()
+
     send(chat, f"{title}\nCHAPTER {number}\n\n{chapter}")
+
+def export_pdf(chat):
+    p = project(chat)
+    if not p:
+        send(chat, "No active novel. Send /new first.")
+        return
+
+    title, bible, outline, _ = p
+
+    chapters = DB.execute(
+        "SELECT number, text FROM chapters WHERE chat=? ORDER BY number",
+        (chat,)
+    ).fetchall()
+
+    from io import BytesIO
+    from xml.sax.saxutils import escape
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, PageBreak
+    )
+
+    buffer = BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=50,
+        leftMargin=50,
+        topMargin=50,
+        bottomMargin=50
+    )
+
+    styles = getSampleStyleSheet()
+
+    story = [
+        Paragraph(escape(title), styles["Title"]),
+        Spacer(1, 20),
+        Paragraph("STORY BIBLE", styles["Heading1"])
+    ]
+
+    for line in (bible or "").splitlines():
+        if line.strip():
+            story.append(Paragraph(escape(line), styles["BodyText"]))
+            story.append(Spacer(1, 5))
+
+    if outline:
+        story.extend([
+            Spacer(1, 15),
+            Paragraph("MASTER OUTLINE", styles["Heading1"])
+        ])
+
+        for line in outline.splitlines():
+            if line.strip():
+                story.append(Paragraph(escape(line), styles["BodyText"]))
+                story.append(Spacer(1, 4))
+
+    for number, chapter in chapters:
+        story.extend([
+            PageBreak(),
+            Paragraph(f"Chapter {number}", styles["Heading1"])
+        ])
+
+        for paragraph in chapter.splitlines():
+            if paragraph.strip():
+                story.append(
+                    Paragraph(escape(paragraph), styles["BodyText"])
+                )
+                story.append(Spacer(1, 8))
+
+    doc.build(story)
+    buffer.seek(0)
+
+    filename = "".join(
+        c if c.isalnum() or c in " -_" else "" for c in title
+    ).strip() or "novel"
+
+    response = requests.post(
+        TG + "/sendDocument",
+        data={"chat_id": chat},
+        files={
+            "document": (
+                filename + ".pdf",
+                buffer,
+                "application/pdf"
+            )
+        },
+        timeout=120
+    )
+    response.raise_for_status()
 
 def handle(chat, text):
     command = text.split()[0].split("@")[0].lower()
 
     if command == "/start":
-        send(chat, "Welcome to your AI Novelist!\n\n"
-             "/new — invent an original novel\n"
-             "/write — write the next chapter\n"
-             "/continue — continue the story\n"
-             "/status — check progress\n"
-             "/remember — inspect continuity memory")
+        send(
+            chat,
+            "Welcome to your AI Novelist!\n\n"
+            "/new — invent an original novel\n"
+            "/write — write the next chapter\n"
+            "/continue — continue the story\n"
+            "/pdf — export your novel\n"
+            "/status — check progress\n"
+            "/remember — inspect continuity memory"
+        )
+
     elif command == "/new":
         new_story(chat)
+
     elif command in ("/write", "/continue"):
         write_chapter(chat)
+
+    elif command in ("/pdf", "pdf"):
+        try:
+            export_pdf(chat)
+        except Exception as exc:
+            print("PDF export failed:", repr(exc))
+            send(chat, "PDF export failed. Please try again.")
+
     elif command == "/status":
         p = project(chat)
         if not p:
             send(chat, "No active novel. Send /new.")
         else:
             count = DB.execute(
-                "SELECT COUNT(*) FROM chapters WHERE chat=?", (chat,)
+                "SELECT COUNT(*) FROM chapters WHERE chat=?",
+                (chat,)
             ).fetchone()[0]
-            send(chat, f"Novel: {p[0]}\nChapters saved: {count}\n"
-                 f"Next chapter: {p[3]}")
+
+            send(
+                chat,
+                f"Novel: {p[0]}\n"
+                f"Chapters saved: {count}\n"
+                f"Next chapter: {p[3]}"
+            )
+
     elif command == "/remember":
         p = project(chat)
         if not p:
@@ -198,17 +362,30 @@ def handle(chat, text):
         else:
             row = DB.execute(
                 "SELECT number,memory FROM chapters WHERE chat=? "
-                "ORDER BY number DESC LIMIT 1", (chat,)
+                "ORDER BY number DESC LIMIT 1",
+                (chat,)
             ).fetchone()
-            send(chat, f"STORY BIBLE\n{p[1]}\n\n"
-                 + (f"LATEST CHAPTER {row[0]} MEMORY:\n{row[1]}"
-                    if row else "No chapters written yet."))
+
+            send(
+                chat,
+                f"STORY BIBLE\n{p[1]}\n\n"
+                + (
+                    f"LATEST CHAPTER {row[0]} MEMORY:\n{row[1]}"
+                    if row else "No chapters written yet."
+                )
+            )
+
     else:
-        send(chat, "Use /new, /write, /continue, /status or /remember.")
+        send(
+            chat,
+            "Use /new, /write, /continue, /pdf, /status or /remember."
+        )
 
 def main():
     print("AI Novelist is starting...")
+
     offset = None
+
     while True:
         try:
             response = requests.get(
@@ -217,23 +394,34 @@ def main():
                 timeout=35
             )
             response.raise_for_status()
+
             for update in response.json().get("result", []):
                 offset = update["update_id"] + 1
                 message = update.get("message", {})
                 chat = message.get("chat", {}).get("id")
                 text = message.get("text", "")
+
                 if chat and text:
                     try:
                         handle(chat, text)
                     except Exception as exc:
-                        print("Request failed:", str(exc))
-                        send(chat, "Something went wrong. Please try again.")
+                        print("Request failed:", repr(exc))
+                        try:
+                            send(
+                                chat,
+                                "The request failed. Check the bot logs for details."
+                            )
+                        except Exception as send_exc:
+                            print("Telegram send failed:", repr(send_exc))
+
         except KeyboardInterrupt:
             print("AI Novelist stopped.")
             break
+
         except Exception as exc:
-            print("Connection error:", str(exc))
+            print("Connection error:", repr(exc))
             time.sleep(5)
 
 if __name__ == "__main__":
     main()
+ 
