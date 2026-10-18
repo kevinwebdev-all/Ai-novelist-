@@ -1,0 +1,6 @@
+config.py
+novelist.db
+novelist.db.backup
+bot_broken_backup.py
+.venv/
+__pycache__/
